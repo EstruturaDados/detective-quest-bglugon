@@ -1,0 +1,336 @@
+/*
+ Detective Quest - Nível Mestre
+ - Árvore binária de salas (mapa da mansão)
+ - BST (árvore de busca) para armazenar pistas coletadas (em ordem)
+ - Tabela hash para associar pista -> suspeito
+ - Exploração interativa; coleta automática de pistas; acusação final
+*/
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define MAX_COLLECTED 100
+#define HASH_SIZE 31        // tamanho simples para a tabela hash (primo pequeno)
+#define MAX_STR 128
+
+//Estruturas de dados
+
+//Nó da árvore binária que representa uma sala 
+typedef struct Sala {
+    char nome[50];
+    char pista[100];           // pista associada a esta sala (pode ser "")
+    struct Sala *esquerda;
+    struct Sala *direita;
+} Sala;
+
+// Nó da BST que armazena pistas coletadas (ordem alfabética)
+typedef struct PistaNode {
+    char pista[100];
+    struct PistaNode *esquerda;
+    struct PistaNode *direita;
+} PistaNode;
+
+//Nó para lista encadeada na tabela hash (encadeamento separado) 
+typedef struct HashNode {
+    char pista[100];           // chave
+    char suspeito[50];         // valor: nome do suspeito
+    struct HashNode *proximo;
+} HashNode;
+
+//Protótipos das funções
+
+//Sala (árvore do mapa) 
+Sala* criarSala(const char *nome, const char *pista);           // cria dinamicamente uma sala
+void liberarSalas(Sala *r);                                     // libera memória da árvore de salas
+
+//BST (pistas coletadas) 
+PistaNode* inserirPista(PistaNode *raiz, const char *pista);    // insere pista (ordenado) - evita duplicatas
+void exibirPistas(PistaNode *raiz);                             // exibe pistas em ordem alfabética
+void liberarPistas(PistaNode *r);
+
+//Tabela hash de pista -> suspeito 
+unsigned int hashString(const char *s);
+void inserirNaHash(HashNode *tabela[], const char *pista, const char *suspeito); // associa pista->suspeito
+const char* encontrarSuspeito(HashNode *tabela[], const char *pista);            // consulta suspeito por pista
+void liberarHash(HashNode *tabela[]);
+
+//Exploração e lógica do jogo 
+void explorarSalas(Sala *raiz, PistaNode **pistasBST, char collected[][100], int *colCount, HashNode *tabela[]);
+void verificarSuspeitoFinal(char collected[][100], int colCount, HashNode *tabela[]);
+
+//Utilitários 
+void safeStrCopy(char dest[], const char src[], size_t n);
+
+//Implementação
+
+//Cria dinamicamente uma sala com nome e pista (pode ser string vazia) 
+Sala* criarSala(const char *nome, const char *pista) {
+    Sala *s = (Sala*) malloc(sizeof(Sala));
+    if (!s) {
+        fprintf(stderr, "Erro de alocação ao criar sala.\n");
+        exit(1);
+    }
+    safeStrCopy(s->nome, nome, sizeof(s->nome));
+    safeStrCopy(s->pista, pista, sizeof(s->pista));
+    s->esquerda = s->direita = NULL;
+    return s;
+}
+
+//Libera memória das salas (pós-ordem)
+void liberarSalas(Sala *r) {
+    if (!r) return;
+    liberarSalas(r->esquerda);
+    liberarSalas(r->direita);
+    free(r);
+}
+
+//Cria um nó para BST de pistas 
+static PistaNode* criarPistaNode(const char *pista) {
+    PistaNode *n = (PistaNode*) malloc(sizeof(PistaNode));
+    if (!n) {
+        fprintf(stderr, "Erro de alocação ao criar nó de pista.\n");
+        exit(1);
+    }
+    safeStrCopy(n->pista, pista, sizeof(n->pista));
+    n->esquerda = n->direita = NULL;
+    return n;
+}
+
+//Insere uma pista na BST de forma ordenada. Se a pista já existe, não insere duplicata. Retorna a nova raiz. 
+PistaNode* inserirPista(PistaNode *raiz, const char *pista) {
+    if (raiz == NULL) {
+        return criarPistaNode(pista);
+    }
+    int cmp = strcmp(pista, raiz->pista);
+    if (cmp < 0) {
+        raiz->esquerda = inserirPista(raiz->esquerda, pista);
+    } else if (cmp > 0) {
+        raiz->direita = inserirPista(raiz->direita, pista);
+    } else {
+        // igual: não insere duplicata
+    }
+    return raiz;
+}
+
+//Exibe as pistas em ordem (in-ordem: alfabético) 
+void exibirPistas(PistaNode *raiz) {
+    if (!raiz) return;
+    exibirPistas(raiz->esquerda);
+    printf(" - %s\n", raiz->pista);
+    exibirPistas(raiz->direita);
+}
+
+//Libera memória da BST 
+void liberarPistas(PistaNode *r) {
+    if (!r) return;
+    liberarPistas(r->esquerda);
+    liberarPistas(r->direita);
+    free(r);
+}
+
+//Hash simples (djb2 mod HASH_SIZE) 
+unsigned int hashString(const char *s) {
+    unsigned long hash = 5381;
+    int c;
+    while ((c = (unsigned char)*s++))
+        hash = ((hash << 5) + hash) + c; /* hash * 33 + c */
+    return (unsigned int)(hash % HASH_SIZE);
+}
+
+//Insere associação pista -> suspeito na tabela hash
+void inserirNaHash(HashNode *tabela[], const char *pista, const char *suspeito) {
+    unsigned int h = hashString(pista);
+    HashNode *novo = (HashNode*) malloc(sizeof(HashNode));
+    if (!novo) {
+        fprintf(stderr, "Erro de alocação na hash.\n");
+        exit(1);
+    }
+    safeStrCopy(novo->pista, pista, sizeof(novo->pista));
+    safeStrCopy(novo->suspeito, suspeito, sizeof(novo->suspeito));
+    novo->proximo = tabela[h];
+    tabela[h] = novo;
+}
+
+//Consulta: dado uma pista, retorna o suspeito ou NULL se não existir
+const char* encontrarSuspeito(HashNode *tabela[], const char *pista) {
+    unsigned int h = hashString(pista);
+    HashNode *cur = tabela[h];
+    while (cur) {
+        if (strcmp(cur->pista, pista) == 0) {
+            return cur->suspeito;
+        }
+        cur = cur->proximo;
+    }
+    return NULL;
+}
+
+//Libera a tabela hash 
+void liberarHash(HashNode *tabela[]) {
+    for (int i = 0; i < HASH_SIZE; i++) {
+        HashNode *cur = tabela[i];
+        while (cur) {
+            HashNode *tmp = cur;
+            cur = cur->proximo;
+            free(tmp);
+        }
+        tabela[i] = NULL;
+    }
+}
+
+//Exploração interativa da mansão:
+  //- inicia em 'raiz', permite navegar (e/d/s)
+  //- ao entrar numa sala, se houver pista (string não vazia), coleta-a:
+  //- adiciona cópia em collected[] (lista de pistas coletadas, podem repetir)
+  //- insere na BST (para exibição ordenada; evita duplicatas)
+
+void explorarSalas(Sala *raiz, PistaNode **pistasBST, char collected[][100], int *colCount, HashNode *tabela[]) {
+    Sala *atual = raiz;
+    char opc;
+
+    while (atual != NULL) {
+        printf("\nVocê está em: %s\n", atual->nome);
+
+        if (strlen(atual->pista) > 0) {
+            printf("Você encontrou uma pista: \"%s\"\n", atual->pista);
+
+            // registra no array de pistas coletadas (mantém duplicatas caso encontremos mesmas pistas em várias salas)
+            if (*colCount < MAX_COLLECTED) {
+                safeStrCopy(collected[*colCount], atual->pista, 100);
+                (*colCount)++;
+            } else {
+                printf("Limite de pistas coletadas atingido; não foi possível registrar mais pistas.\n");
+            }
+
+            // insere na BST (para exibição ordenada)
+            *pistasBST = inserirPista(*pistasBST, atual->pista);
+        } else {
+            printf("Nenhuma pista aparente nesta sala.\n");
+        }
+
+        // opções de navegação
+        printf("\nCaminhos disponíveis:\n");
+        if (atual->esquerda) printf(" (e) esquerda -> %s\n", atual->esquerda->nome);
+        if (atual->direita)  printf(" (d) direita  -> %s\n", atual->direita->nome);
+        printf(" (s) sair da exploração\n");
+        printf("Escolha: ");
+        scanf(" %c", &opc);
+
+        if (opc == 'e' && atual->esquerda) {
+            atual = atual->esquerda;
+        } else if (opc == 'd' && atual->direita) {
+            atual = atual->direita;
+        } else if (opc == 's') {
+            printf("Saindo da exploração...\n");
+            break;
+        } else {
+            printf("Escolha inválida ou caminho inexistente. Tente novamente.\n");
+        }
+    }
+}
+
+//Verifica se a acusação do jogador tem pelo menos 2 pistas que apontam para o suspeito.
+//- collected[] contém todas as pistas coletadas (podem repetir)
+//- tabela hash dá, para cada pista, o suspeito associado
+// Exibe o resultado apropriado. 
+void verificarSuspeitoFinal(char collected[][100], int colCount, HashNode *tabela[]) {
+    if (colCount == 0) {
+        printf("\nNenhuma pista coletada; não é possível acusar com segurança.\n");
+        return;
+    }
+
+    char acusado[50];
+    printf("\nDigite o nome do suspeito que deseja acusar: ");
+    // ler linha com espaços
+    scanf(" %49[^\n]", acusado);
+
+    int count = 0;
+    // percorre todas as pistas coletadas e conta quantas apontam para o acusado
+    for (int i = 0; i < colCount; i++) {
+        const char *sus = encontrarSuspeito(tabela, collected[i]);
+        if (sus != NULL && strcmp(sus, acusado) == 0) {
+            count++;
+        }
+    }
+
+    printf("\nPistas coletadas: %d. Pistas que apontam para %s: %d\n", colCount, acusado, count);
+    if (count >= 2) {
+        printf("Resultado: Acusação SUSTENTADA. %s é provavelmente o culpado. ⚖️\n", acusado);
+    } else {
+        printf("Resultado: Acusação FRACA. Não há evidências suficientes contra %s. ❌\n", acusado);
+    }
+}
+
+//Cópia de string segura
+void safeStrCopy(char dest[], const char src[], size_t n) {
+    if (n == 0) return;
+    strncpy(dest, src, n - 1);
+    dest[n - 1] = '\0';
+}
+
+//main: monta mapa, hash de pistas->suspeitos, inicia exploração
+int main() {
+    //Monta mapa (árvore binária) - fixo e pré-definido:
+    //       Hall
+    //       /  \
+    //    Estar  Cozinha
+    //    / \       \
+    //  Biblioteca Jardim  Despensa (filho direito)
+  
+    Sala *hall = criarSala("Hall de Entrada", "Pegada encharcada");
+    Sala *estar = criarSala("Sala de Estar", "Xícara quebrada");
+    Sala *cozinha = criarSala("Cozinha", "Luvas sujas");
+    Sala *biblioteca = criarSala("Biblioteca", "Livro rasgado no capítulo 3");
+    Sala *jardim = criarSala("Jardim", "Flor caída com perfume forte");
+    Sala *despensa = criarSala("Despensa", "Rótulo de veneno vazio");
+
+    // ligações
+    hall->esquerda = estar;
+    hall->direita = cozinha;
+    estar->esquerda = biblioteca;
+    estar->direita = jardim;
+    cozinha->direita = despensa;
+
+    // Cria tabela hash e associa pistas a suspeitos. Essas associações são fixas para o desafio
+    HashNode *tabela[HASH_SIZE];
+    for (int i = 0; i < HASH_SIZE; i++) tabela[i] = NULL;
+
+    // mapear pistas -> suspeitos
+    inserirNaHash(tabela, "Pegada encharcada", "Sr. Verde");
+    inserirNaHash(tabela, "Xícara quebrada", "Sra. Azul");
+    inserirNaHash(tabela, "Luvas sujas", "Sr. Verde");
+    inserirNaHash(tabela, "Livro rasgado no capítulo 3", "Prof. Cinza");
+    inserirNaHash(tabela, "Flor caída com perfume forte", "Sra. Amarela");
+    inserirNaHash(tabela, "Rótulo de veneno vazio", "Sra. Amarela");
+
+    //Estruturas para pistas coletadas 
+    PistaNode *pistasBST = NULL;                 // BST para exibir pistas ordenadas (únicas)
+    char collected[MAX_COLLECTED][100];          // lista em ordem de coleta (pode conter duplicatas)
+    int collectedCount = 0;
+
+    //Mensagem inicial e exploração 
+    printf("=== Detective Quest - Investigação Final ===\n");
+    printf("Explore a mansão. Ao entrar em cada sala, pistas são coletadas automaticamente.\n");
+    printf("Ao terminar a exploração, você poderá acusar um suspeito.\n");
+
+    explorarSalas(hall, &pistasBST, collected, &collectedCount, tabela);
+
+    //Exibe pistas coletadas (lista em ordem alfabética pela BST) 
+    printf("\n==================== Pistas coletadas (ordem alfabética) ====================\n");
+    if (pistasBST == NULL) {
+        printf("Nenhuma pista coletada.\n");
+    } else {
+        exibirPistas(pistasBST);
+    }
+
+    //Fase final: acusação 
+    verificarSuspeitoFinal(collected, collectedCount, tabela);
+
+    //Limpeza de memória 
+    liberarPistas(pistasBST);
+    liberarHash(tabela);
+    liberarSalas(hall);
+
+    printf("\nEncerrando investigação. Obrigado por jogar!\n");
+    return 0;
+}
